@@ -1,0 +1,13 @@
+{
+  "itemGroup.worldexporter": "Example Mod Tab",
+  "block.worldexporter.example_block": "Example Block",
+  "item.worldexporter.example_item": "Example Item",
+
+  "worldexporter.configuration.title": "World Exporter Configs",
+  "worldexporter.configuration.section.worldexporter.common.toml": "World Exporter Configs",
+  "worldexporter.configuration.section.worldexporter.common.toml.title": "World Exporter Configs",
+  "worldexporter.configuration.items": "Item List",
+  "worldexporter.configuration.logDirtBlock": "Log Dirt Block",
+  "worldexporter.configuration.magicNumberIntroduction": "Magic Number Text",
+  "worldexporter.configuration.magicNumber": "Magic Number"
+}
