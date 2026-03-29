@@ -3,6 +3,7 @@ package com.shak.worldexporter;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.ChunkPos;
@@ -10,6 +11,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -19,6 +21,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.zip.GZIPOutputStream;
 
 public class WorldExporterService {
 
@@ -48,7 +51,6 @@ public class WorldExporterService {
             }
 
             // Use the pre-built JSON that was read on the server thread during shutdown
-            // We don't touch the world at all here
             String worldName = ServerEvents.cachedWorldName;
             String worldJson = ServerEvents.cachedWorldJson;
 
@@ -58,20 +60,24 @@ public class WorldExporterService {
             }
 
             // Replace spaces with underscores for the GitHub folder name
-            // "New World" becomes "New_World" which is cleaner than URL encoding
-            // The original worldName is kept for display in index.json
+            // "New World" becomes "New_World"
             String safeName = worldName.replace(" ", "_");
 
-            WorldExporter.LOGGER.info("World Exporter: uploading world '{}'", worldName);
+            WorldExporter.LOGGER.info("World Exporter: compressing world data...");
 
-            // Push world_data.json to GitHub under the world's folder
-            // e.g. worlds/New_World/world_data.json
-            String worldDataPath = "worlds/" + safeName + "/world_data.json";
-            pushFileToGitHub(token, owner, repo, worldDataPath, worldJson,
+            // Compress the JSON with GZIP before uploading
+            // This typically reduces file size by 90%+
+            byte[] compressed = compress(worldJson);
+            WorldExporter.LOGGER.info("World Exporter: compressed from {}KB to {}KB",
+                    worldJson.getBytes().length / 1024, compressed.length / 1024);
+
+            // Push world_data.json.gz to GitHub under worldinfo/worlds/
+            // e.g. worldinfo/worlds/New_World/world_data.json.gz
+            String worldDataPath = "worldinfo/worlds/" + safeName + "/world_data.json.gz";
+            pushFileToGitHub(token, owner, repo, worldDataPath, compressed,
                     "Update " + worldName + " world data");
 
-            // Update index.json so the HTML page knows this world exists
-            // We pass worldName (with spaces) for display and safeName for the path
+            // Update worldinfo/index.json so the HTML page knows this world exists
             updateIndexJson(token, owner, repo, worldName, safeName);
 
             WorldExporter.LOGGER.info("World Exporter: upload complete!");
@@ -81,7 +87,19 @@ public class WorldExporterService {
         }
     }
 
-    // Reads all blocks in the configured area and returns them as a JSON string
+    // Compresses a string using GZIP and returns the compressed bytes
+    // Java's built-in GZIP — no extra libraries needed
+    private byte[] compress(String data) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(bos)) {
+            gzip.write(data.getBytes());
+        }
+        return bos.toByteArray();
+    }
+
+    // Reads all VISIBLE blocks in the configured area and returns them as a JSON string
+    // A block is visible if at least one of its 6 neighbours is air
+    // Blocks completely surrounded by other blocks are invisible and skipped
     // Called on the server thread during shutdown so the world is still accessible
     // Public so ServerEvents can call it directly
     public String buildWorldJson(int centerX, int centerZ, int radius) {
@@ -109,6 +127,7 @@ public class WorldExporterService {
 
         int totalChunks = (radius * 2) * (radius * 2);
         int chunkCount = 0;
+        int skippedBlocks = 0;
 
         for (int dx = -radius; dx < radius; dx++) {
             for (int dz = -radius; dz < radius; dz++) {
@@ -119,9 +138,7 @@ public class WorldExporterService {
                 WorldExporter.LOGGER.info("World Exporter: chunk ({},{}) [{}/{}]",
                         chunkX, chunkZ, chunkCount, totalChunks);
 
-                // Load the chunk — if it exists on disk it loads instantly
-                // If it hasn't been visited it will be generated from scratch
-                // This is safe because we're on the server thread during shutdown
+                // Load the chunk from disk
                 LevelChunk chunk = world.getChunk(chunkX, chunkZ);
                 ChunkPos chunkPos = chunk.getPos();
 
@@ -130,15 +147,24 @@ public class WorldExporterService {
                 int baseZ = chunkPos.getMinBlockZ();
 
                 // Loop every block in the chunk across the full height range
-                // getMinY() = -64, getMaxY() = 320 in modern Minecraft
                 for (int x = 0; x < 16; x++) {
                     for (int z = 0; z < 16; z++) {
                         for (int y = world.getMinY(); y < world.getMaxY(); y++) {
-                            BlockPos pos = new BlockPos(baseX + x, y, baseZ + z);
+                            int worldX = baseX + x;
+                            int worldZ = baseZ + z;
+                            BlockPos pos = new BlockPos(worldX, y, worldZ);
                             BlockState state = chunk.getBlockState(pos);
 
-                            // Skip all air variants — no point sending them to the viewer
+                            // Skip all air variants
                             if (state.isAir()) continue;
+
+                            // Check if this block is exposed to air on any of its 6 faces
+                            // If all 6 neighbours are solid, this block is invisible — skip it
+                            // This dramatically reduces the block count
+                            if (!isExposedToAir(world, pos)) {
+                                skippedBlocks++;
+                                continue;
+                            }
 
                             // Look up the block's registry name e.g. "minecraft:stone"
                             String name = BuiltInRegistries.BLOCK
@@ -153,9 +179,9 @@ public class WorldExporterService {
 
                             // Each block entry: [worldX, worldY, worldZ, paletteIndex]
                             JsonArray block = new JsonArray();
-                            block.add(baseX + x);
+                            block.add(worldX);
                             block.add(y);
-                            block.add(baseZ + z);
+                            block.add(worldZ);
                             block.add(paletteIndex.get(name));
                             blocks.add(block);
                         }
@@ -164,8 +190,8 @@ public class WorldExporterService {
             }
         }
 
-        WorldExporter.LOGGER.info("World Exporter: {} blocks across {} types",
-                blocks.size(), palette.size());
+        WorldExporter.LOGGER.info("World Exporter: {} visible blocks, {} hidden blocks skipped, {} types",
+                blocks.size(), skippedBlocks, palette.size());
 
         // Build the final JSON object that the HTML viewer expects
         JsonObject root = new JsonObject();
@@ -174,7 +200,22 @@ public class WorldExporterService {
         return root.toString();
     }
 
-    // Updates index.json which lists all worlds and their last update time
+    // Checks if a block at the given position is exposed to air on any of its 6 faces
+    // Uses Direction.values() which gives us all 6 directions: UP, DOWN, NORTH, SOUTH, EAST, WEST
+    private boolean isExposedToAir(Level world, BlockPos pos) {
+        for (Direction direction : Direction.values()) {
+            // Get the block position one step in this direction
+            BlockPos neighbour = pos.relative(direction);
+            // If this neighbour is air, the block is exposed
+            if (world.getBlockState(neighbour).isAir()) {
+                return true;
+            }
+        }
+        // All 6 neighbours are solid — block is completely hidden
+        return false;
+    }
+
+    // Updates worldinfo/index.json which lists all worlds and their last update time
     // worldName = display name with spaces e.g. "New World"
     // safeName = folder name with underscores e.g. "New_World"
     private void updateIndexJson(String token, String owner,
@@ -182,7 +223,7 @@ public class WorldExporterService {
             throws IOException, InterruptedException {
 
         // Try to fetch the existing index.json from GitHub
-        String existingJson = fetchFileContent(token, owner, repo, "index.json");
+        String existingJson = fetchFileContent(token, owner, repo, "worldinfo/index.json");
 
         JsonObject index;
         if (existingJson == null) {
@@ -209,26 +250,26 @@ public class WorldExporterService {
 
         if (!found) {
             // New world — add it to the index
-            // Store both the display name and the safe folder name
             JsonObject newWorld = new JsonObject();
-            newWorld.addProperty("name", worldName);       // "New World" — shown in the HTML viewer
-            newWorld.addProperty("folder", safeName);      // "New_World" — used in the file path
+            newWorld.addProperty("name", worldName);       // "New World" — shown in HTML viewer
+            newWorld.addProperty("folder", safeName);      // "New_World" — used in file path
             newWorld.addProperty("lastUpdated", Instant.now().toString());
             worlds.add(newWorld);
         }
 
-        pushFileToGitHub(token, owner, repo, "index.json",
-                index.toString(), "Update world index");
+        pushFileToGitHub(token, owner, repo, "worldinfo/index.json",
+                index.toString().getBytes(), "Update world index");
     }
 
     // Pushes a file to GitHub via the contents API
+    // Takes raw bytes so it works for both text (JSON) and binary (GZIP) files
     // Creates the file if it doesn't exist, updates it if it does
     private void pushFileToGitHub(String token, String owner, String repo,
-                                  String path, String content, String commitMessage)
+                                  String path, byte[] content, String commitMessage)
             throws IOException, InterruptedException {
 
         // GitHub requires file content to be Base64 encoded
-        String encoded = Base64.getEncoder().encodeToString(content.getBytes());
+        String encoded = Base64.getEncoder().encodeToString(content);
 
         // Get the existing file's SHA — needed to update an existing file
         // Returns null if the file doesn't exist yet (first push)
